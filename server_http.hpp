@@ -4,6 +4,7 @@
 #include "asio_compatibility.hpp"
 #include "mutex.hpp"
 #include "utility.hpp"
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -11,6 +12,7 @@
 #include <map>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 // Late 2017 TODO: remove the following checks and always use std::regex
@@ -271,6 +273,17 @@ namespace SimpleWeb {
         return asio::ip::tcp::endpoint();
       }
 
+      /// Returns the transport object that owns this request's connection.
+      /// The aliasing shared pointer keeps the private Connection alive while
+      /// server-specific authenticated transport metadata is inspected.
+      std::shared_ptr<socket_type> connection_socket() const noexcept {
+        if(auto active_connection = this->connection.lock()) {
+          auto socket = active_connection->socket.get();
+          return std::shared_ptr<socket_type>(std::move(active_connection), socket);
+        }
+        return {};
+      }
+
       /// Deprecated, please use remote_endpoint().address().to_string() instead.
       SW_DEPRECATED std::string remote_endpoint_address() const noexcept {
         try {
@@ -316,6 +329,9 @@ namespace SimpleWeb {
       strand write_strand;
 
       std::unique_ptr<asio::steady_timer> timer;
+
+      bool admission_counted = false;
+      std::string admission_source;
 
       void close() noexcept {
         error_code ec;
@@ -380,6 +396,12 @@ namespace SimpleWeb {
       /// Maximum size of request stream buffer. Defaults to architecture maximum.
       /// Reaching this limit will result in a message_size error code.
       std::size_t max_request_streambuf_size = (std::numeric_limits<std::size_t>::max)();
+      /// Reject requests using Transfer-Encoding before reading their body. Defaults to false.
+      bool reject_transfer_encoding = false;
+      /// Maximum accepted connections retained at once. Zero disables the limit.
+      std::size_t max_active_connections = 0;
+      /// Maximum accepted connections retained for one normalized source. Zero disables the limit.
+      std::size_t max_active_connections_per_source = 0;
       /// IPv4 address in dotted decimal form or IPv6 address in hexadecimal notation.
       /// If empty, the address will be any address.
       std::string address;
@@ -419,6 +441,21 @@ namespace SimpleWeb {
 
     /// If you want to reuse an already created asio::io_service, store its pointer here before calling start().
     std::shared_ptr<io_context> io_service;
+
+    /// Normalize IPv4-mapped addresses and group native IPv6 sources by /64.
+    static std::string connection_source_key(asio::ip::address address) {
+      if(address.is_v6()) {
+        auto ipv6 = address.to_v6();
+        if(ipv6.is_v4_mapped())
+          address = asio::ip::make_address_v4(asio::ip::v4_mapped, ipv6);
+      }
+      if(address.is_v4())
+        return std::string("v4:") + address.to_string();
+
+      auto bytes = address.to_v6().to_bytes();
+      std::fill(bytes.begin() + 8, bytes.end(), 0);
+      return std::string("v6:") + asio::ip::address_v6(bytes).to_string() + "/64";
+    }
 
     /// Start the server.
     /// If io_service is not set, an internal io_service is created instead.
@@ -535,6 +572,8 @@ namespace SimpleWeb {
     struct Connections {
       Mutex mutex;
       std::unordered_set<Connection *> set GUARDED_BY(mutex);
+      std::size_t active_count GUARDED_BY(mutex) = 0;
+      std::unordered_map<std::string, std::size_t> active_by_source GUARDED_BY(mutex);
     };
     std::shared_ptr<Connections> connections;
 
@@ -551,6 +590,17 @@ namespace SimpleWeb {
       auto connection = std::shared_ptr<Connection>(new Connection(handler_runner, std::forward<Args>(args)...), [connections](Connection *connection) {
         {
           LockGuard lock(connections->mutex);
+          if(connection->admission_counted) {
+            if(connections->active_count > 0)
+              --connections->active_count;
+            auto source = connections->active_by_source.find(connection->admission_source);
+            if(source != connections->active_by_source.end()) {
+              if(source->second > 1)
+                --source->second;
+              else
+                connections->active_by_source.erase(source);
+            }
+          }
           auto it = connections->set.find(connection);
           if(it != connections->set.end())
             connections->set.erase(it);
@@ -562,6 +612,22 @@ namespace SimpleWeb {
         connections->set.emplace(connection.get());
       }
       return connection;
+    }
+
+    bool admit_connection(const std::shared_ptr<Connection> &connection, const asio::ip::address &address) {
+      const auto source_key = connection_source_key(address);
+      LockGuard lock(connections->mutex);
+      const auto source = connections->active_by_source.find(source_key);
+      const auto source_count = source == connections->active_by_source.end() ? 0 : source->second;
+      if((config.max_active_connections > 0 && connections->active_count >= config.max_active_connections) ||
+         (config.max_active_connections_per_source > 0 && source_count >= config.max_active_connections_per_source))
+        return false;
+
+      ++connections->active_count;
+      ++connections->active_by_source[source_key];
+      connection->admission_counted = true;
+      connection->admission_source = source_key;
+      return true;
     }
 
     void read(const std::shared_ptr<Session> &session) {
@@ -588,8 +654,19 @@ namespace SimpleWeb {
             return;
           }
 
+          // Reject unsupported transfer codings before buffering their content.
+          auto header_it = session->request->header.find("Transfer-Encoding");
+          if(this->config.reject_transfer_encoding && header_it != session->request->header.end()) {
+            auto response = std::shared_ptr<Response>(new Response(session, this->config.timeout_content));
+            response->write(StatusCode::client_error_bad_request);
+            response->send();
+            if(this->on_error)
+              this->on_error(session->request, make_error_code::make_error_code(errc::protocol_error));
+            return;
+          }
+
           // If content, read that as well
-          auto header_it = session->request->header.find("Content-Length");
+          header_it = session->request->header.find("Content-Length");
           if(header_it != session->request->header.end()) {
             unsigned long long content_length = 0;
             try {
@@ -603,6 +680,7 @@ namespace SimpleWeb {
             if(content_length > session->request->streambuf->max_size()) {
               auto response = std::shared_ptr<Response>(new Response(session, this->config.timeout_content));
               response->write(StatusCode::client_error_payload_too_large);
+              response->send();
               if(this->on_error)
                 this->on_error(session->request, make_error_code::make_error_code(errc::message_size));
               return;
@@ -676,6 +754,7 @@ namespace SimpleWeb {
           if(chunk_size + session->request->content_streambuf.size() > session->request->content_streambuf.max_size()) {
             auto response = std::shared_ptr<Response>(new Response(session, this->config.timeout_content));
             response->write(StatusCode::client_error_payload_too_large);
+            response->send();
             if(this->on_error)
               this->on_error(session->request, make_error_code::make_error_code(errc::message_size));
             return;
@@ -861,6 +940,12 @@ namespace SimpleWeb {
         auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
 
         if(!ec) {
+          error_code endpoint_error;
+          const auto remote_endpoint = session->connection->socket->remote_endpoint(endpoint_error);
+          if(endpoint_error || !this->admit_connection(connection, remote_endpoint.address())) {
+            connection->close();
+            return;
+          }
           asio::ip::tcp::no_delay option(true);
           error_code ec;
           session->connection->socket->set_option(option, ec);

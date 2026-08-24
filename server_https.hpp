@@ -76,6 +76,12 @@ namespace SimpleWeb {
         auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
 
         if(!ec) {
+          error_code endpoint_error;
+          const auto remote_endpoint = session->connection->socket->lowest_layer().remote_endpoint(endpoint_error);
+          if(endpoint_error || !this->admit_connection(connection, remote_endpoint.address())) {
+            connection->close();
+            return;
+          }
           asio::ip::tcp::no_delay option(true);
           error_code ec;
           session->connection->socket->lowest_layer().set_option(option, ec);
